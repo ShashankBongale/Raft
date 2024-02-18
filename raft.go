@@ -85,9 +85,16 @@ type Raft struct {
 	lastVotedTerm int
 	votedFor      int
 
-	eventLog          []Event
-	committedEventLog []Event
+	//eventLog          []Event
+	committedEventLog []Event //should change this name
 	applitedEventLog  []Event //We might not need this
+
+	nextIndexForPeers map[int]int
+
+	toBeCommittedEvent    int
+	eventReplicationCount map[int]int
+
+	applyCh chan ApplyMsg
 }
 
 // example RequestVote RPC arguments structure.
@@ -108,12 +115,20 @@ type RequestVoteReply struct {
 }
 
 type AppendEntriesArgs struct {
-	Term     int
-	LeaderId int
+	Term       int
+	LeaderId   int
+	NewCommand interface{}
+
+	PreceedingIndex int
+	PreceedingTerm  int
+	//PreceedingCommand interface{}
+
+	CommittedIndex int
 }
 
 type AppendEntriesReply struct {
-	CurrentTerm int
+	CurrentTerm         int
+	IsRequestSuccessful bool
 }
 
 // return currentTerm and whether this server
@@ -240,9 +255,42 @@ func (rf *Raft) AppendEntry(args *AppendEntriesArgs, reply *AppendEntriesReply) 
 		}
 	}
 
+	reply.CurrentTerm = currentTerm
+
+	if rf.currentSeverState == follower {
+		logEntryCount := len(rf.committedEventLog)
+
+		//Consistency check
+		if logEntryCount > 0 {
+			lastEvent := rf.committedEventLog[logEntryCount-1]
+
+			if lastEvent.Term != args.PreceedingTerm || logEntryCount-1 != args.PreceedingIndex /*|| lastEvent.Command != args.PreceedingCommand*/ {
+				reply.IsRequestSuccessful = false
+
+				rf.mu.Unlock()
+				return
+			}
+		}
+
+		//fmt.Println("Server", rf.me, "got command", args.NewCommand)
+		reply.IsRequestSuccessful = true
+
+		if args.NewCommand != "" {
+			newEvent := Event{Command: args.NewCommand, Term: currentTerm}
+			rf.committedEventLog = append(rf.committedEventLog, newEvent)
+
+		}
+
+		if args.CommittedIndex != -1 {
+			applyMsg := ApplyMsg{CommandValid: true, Command: rf.committedEventLog[args.CommittedIndex].Command, CommandIndex: args.CommittedIndex + 1}
+			//fmt.Println("Follower server sending apply msg", applyMsg)
+			rf.applyCh <- applyMsg
+		}
+
+	}
+
 	rf.mu.Unlock()
 
-	reply.CurrentTerm = currentTerm
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -303,9 +351,38 @@ func (rf *Raft) heartBeatSender() {
 		for peerItr := 0; peerItr < len(rf.peers); peerItr++ {
 			if peerItr != rf.me {
 				wg.Add(1)
-				go func(peerId int) {
-					args := AppendEntriesArgs{Term: rf.currentTerm, LeaderId: rf.me}
-					reply := AppendEntriesReply{CurrentTerm: -1}
+
+				preceedingIndex := -1
+				preceedingTerm := -1
+				var preceedingCommand interface{}
+				var newCmd interface{} = ""
+				committedIndex := -1
+
+				rf.mu.Lock()
+
+				if rf.nextIndexForPeers[peerItr] != 0 {
+					preceedingIndex = rf.nextIndexForPeers[peerItr] - 1
+					preceedingTerm = rf.committedEventLog[preceedingIndex].Term
+					preceedingCommand = rf.committedEventLog[preceedingIndex].Command
+				}
+
+				if rf.nextIndexForPeers[peerItr] < len(rf.committedEventLog) {
+					newCmd = rf.committedEventLog[rf.nextIndexForPeers[peerItr]].Command
+				}
+
+				if rf.toBeCommittedEvent > 0 {
+					committedIndex = rf.toBeCommittedEvent - 1
+				}
+
+				rf.mu.Unlock()
+
+				go func(peerId int, newCmd interface{}, preceedingIndex int, preceedingTerm int, preceedingCmd interface{}, committedIndex int) {
+
+					if newCmd != "" {
+						fmt.Println("Server", rf.me, "sending command for index", preceedingIndex+1, "to server", peerId)
+					}
+					args := AppendEntriesArgs{Term: rf.currentTerm, LeaderId: rf.me, NewCommand: newCmd, PreceedingIndex: preceedingIndex, PreceedingTerm: preceedingTerm /*PreceedingCommand: preceedingCmd, */, CommittedIndex: committedIndex}
+					reply := AppendEntriesReply{CurrentTerm: -1, IsRequestSuccessful: false}
 
 					ok := rf.sendAppendEntries(peerId, &args, &reply)
 					if ok {
@@ -314,9 +391,26 @@ func (rf *Raft) heartBeatSender() {
 							maxTerm = reply.CurrentTerm
 						}
 						maxTermLock.Unlock()
+
+						if newCmd != "" {
+							if !reply.IsRequestSuccessful {
+								rf.mu.Lock()
+
+								if rf.nextIndexForPeers[peerId] != 0 {
+									rf.nextIndexForPeers[peerId] -= 1
+								}
+
+								rf.mu.Unlock()
+							} else {
+								rf.mu.Lock()
+								rf.eventReplicationCount[rf.nextIndexForPeers[peerId]] += 1
+								rf.nextIndexForPeers[peerId] += 1
+								rf.mu.Unlock()
+							}
+						}
 					}
 					wg.Done()
-				}(peerItr)
+				}(peerItr, newCmd, preceedingIndex, preceedingTerm, preceedingCommand, committedIndex)
 			}
 		}
 
@@ -335,6 +429,21 @@ func (rf *Raft) heartBeatSender() {
 			rf.mu.Unlock()
 			return
 		}
+
+		rf.mu.Lock()
+		if len(rf.committedEventLog) > 0 && rf.eventReplicationCount[rf.toBeCommittedEvent] >= int(math.Ceil(float64((len(rf.peers))/2.0))) {
+
+			fmt.Println("Command committed by server", rf.me, "for index", rf.toBeCommittedEvent)
+			applyMsg := ApplyMsg{CommandValid: true, Command: rf.committedEventLog[rf.toBeCommittedEvent].Command, CommandIndex: rf.toBeCommittedEvent + 1}
+
+			//fmt.Println("Leader server sending apply msg", applyMsg)
+
+			rf.applyCh <- applyMsg
+
+			rf.toBeCommittedEvent += 1
+
+		}
+		rf.mu.Unlock()
 
 		time.Sleep(10 * time.Millisecond)
 
@@ -363,8 +472,22 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (2B).
+	rf.mu.Lock()
+	isLeader = rf.currentSeverState == leader
+	if !isLeader {
+		rf.mu.Unlock()
+		return index, term, isLeader
+	}
 
-	return index, term, isLeader
+	term = rf.currentTerm
+	var newEvent Event = Event{Command: command, Term: term}
+	rf.committedEventLog = append(rf.committedEventLog, newEvent)
+	index = len(rf.committedEventLog) - 1
+	rf.eventReplicationCount[index] = 1
+	fmt.Println("Got data for index", index, "for server", rf.me)
+	rf.mu.Unlock()
+
+	return index + 1, term, isLeader
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
@@ -530,6 +653,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
+	rf.applyCh = applyCh
 
 	// Your initialization code here (2A, 2B, 2C).
 
@@ -541,6 +665,14 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
+	rf.nextIndexForPeers = make(map[int]int)
+	rf.eventReplicationCount = make(map[int]int)
+
+	for peerItr := 0; peerItr < len(peers); peerItr++ {
+		rf.nextIndexForPeers[peerItr] = 0
+	}
+
+	rf.toBeCommittedEvent = 0
 	// start ticker goroutine to start elections
 	go rf.ticker()
 
