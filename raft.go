@@ -60,6 +60,11 @@ const (
 	killed
 )
 
+type Event struct {
+	Command interface{}
+	Term    int
+}
+
 // A Go object implementing a single Raft peer.
 type Raft struct {
 	mu        sync.Mutex          // Lock to protect shared access to this peer's state
@@ -79,6 +84,36 @@ type Raft struct {
 
 	lastVotedTerm int
 	votedFor      int
+
+	eventLog          []Event
+	committedEventLog []Event
+	applitedEventLog  []Event //We might not need this
+}
+
+// example RequestVote RPC arguments structure.
+// field names must start with capital letters!
+type RequestVoteArgs struct {
+	// Your data here (2A, 2B).
+
+	CandidateTerm                int
+	CandidateId                  int
+	CandidateCommittedEventCount int
+}
+
+// example RequestVote RPC reply structure.
+// field names must start with capital letters!
+type RequestVoteReply struct {
+	// Your data here (2A).
+	VoteGranted bool
+}
+
+type AppendEntriesArgs struct {
+	Term     int
+	LeaderId int
+}
+
+type AppendEntriesReply struct {
+	CurrentTerm int
 }
 
 // return currentTerm and whether this server
@@ -150,31 +185,6 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 
 }
 
-// example RequestVote RPC arguments structure.
-// field names must start with capital letters!
-type RequestVoteArgs struct {
-	// Your data here (2A, 2B).
-
-	CandidateTerm int
-	CandidateId   int
-}
-
-// example RequestVote RPC reply structure.
-// field names must start with capital letters!
-type RequestVoteReply struct {
-	// Your data here (2A).
-	VoteGranted bool
-}
-
-type AppendEntriesArgs struct {
-	Term     int
-	LeaderId int
-}
-
-type AppendEntriesReply struct {
-	CurrentTerm int
-}
-
 // example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
@@ -183,7 +193,21 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	rf.mu.Lock()
 
-	if rf.currentTerm < args.CandidateTerm && rf.lastVotedTerm < args.CandidateTerm {
+	committedEventCount := len(rf.committedEventLog)
+	/*var lastCommittedLogTerm int = -1
+
+	if committedEventCount > 0 {
+		lastCommittedLogTerm = rf.committedEventLog[committedEventCount-1].Term
+	}*/
+
+	var isCandidateHasAllInfo bool = false
+
+	//Leader should have upto date info as of this server. This is election restriction in paper
+	if rf.currentTerm <= args.CandidateTerm && committedEventCount <= args.CandidateCommittedEventCount {
+		isCandidateHasAllInfo = true
+	}
+
+	if isCandidateHasAllInfo && rf.lastVotedTerm < args.CandidateTerm {
 		reply.VoteGranted = true
 		fmt.Println("Server", rf.me, "granting vote for", args.CandidateId, "for term", args.CandidateTerm)
 		rf.lastVotedTerm = args.CandidateTerm
@@ -393,10 +417,12 @@ func (rf *Raft) ticker() {
 			fmt.Println("Starting election for server", rf.me)
 
 			var currentTerm int
+			var committedEventCount int
 			rf.mu.Lock()
 			rf.currentSeverState = candidate
 			rf.currentTerm += 1
 			currentTerm = rf.currentTerm
+			committedEventCount = len(rf.committedEventLog)
 			rf.mu.Unlock()
 
 			//what happens when majority of servers are down? Should that case be handled?
@@ -412,7 +438,7 @@ func (rf *Raft) ticker() {
 
 					go func(peerId int) {
 
-						args := RequestVoteArgs{CandidateTerm: currentTerm, CandidateId: rf.me}
+						args := RequestVoteArgs{CandidateTerm: currentTerm, CandidateId: rf.me, CandidateCommittedEventCount: committedEventCount}
 						reply := RequestVoteReply{VoteGranted: false}
 						ok := rf.sendRequestVote(peerId, &args, &reply)
 
