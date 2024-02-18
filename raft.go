@@ -85,8 +85,12 @@ type Raft struct {
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
 
+	//rf.currentSeverState
+	//fmt.Println("Checking status for server", rf.me)
 	var term int = -1
 	var isleader bool = false
+
+	// Your code here (2A).
 
 	if !rf.killed() {
 		rf.mu.Lock()
@@ -95,6 +99,7 @@ func (rf *Raft) GetState() (int, bool) {
 		rf.mu.Unlock()
 	}
 
+	//fmt.Println("Server", rf.me, "is in leader state:", isleader, "with term", term)
 	return term, isleader
 }
 
@@ -170,6 +175,7 @@ type AppendEntriesReply struct {
 	CurrentTerm int
 }
 
+// example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 
@@ -197,6 +203,8 @@ func (rf *Raft) AppendEntry(args *AppendEntriesArgs, reply *AppendEntriesReply) 
 	rf.lastLeaderComTime = time.Now()
 	currentTerm = rf.currentTerm
 	currentState = rf.currentSeverState
+
+	//fmt.Println("Got append request from server", args.LeaderId, "with term", args.Term, "for server", rf.me, "with term", rf.currentTerm)
 
 	if currentTerm <= args.Term {
 
@@ -241,12 +249,13 @@ func (rf *Raft) AppendEntry(args *AppendEntriesArgs, reply *AppendEntriesReply) 
 // that the caller passes the address of the reply struct with &, not
 // the struct itself.
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
-
+	//fmt.Println("Sending vote request from", rf.me, "to", server)
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 	return ok
 }
 
 func (rf *Raft) sendAppendEntries(serverId int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	//fmt.Println("Sending appen entry request from", rf.me, "to", serverId)
 	ok := rf.peers[serverId].Call("Raft.AppendEntry", args, reply)
 	return ok
 }
@@ -263,17 +272,13 @@ func (rf *Raft) heartBeatSender() {
 
 	for currentServerState == leader && !isKilled {
 
-		//These are terms from follower nodes
 		var maxTerm int = -1
 		var maxTermLock sync.Mutex
-
 		var wg sync.WaitGroup
 
 		for peerItr := 0; peerItr < len(rf.peers); peerItr++ {
 			if peerItr != rf.me {
-
 				wg.Add(1)
-
 				go func(peerId int) {
 					args := AppendEntriesArgs{Term: rf.currentTerm, LeaderId: rf.me}
 					reply := AppendEntriesReply{CurrentTerm: -1}
@@ -298,9 +303,6 @@ func (rf *Raft) heartBeatSender() {
 		rf.mu.Lock()
 		currentTerm = rf.currentTerm
 		rf.mu.Unlock()
-
-		//If leader is not holding the highest term then make it follower and let the
-		//current leader reconnecet or if there is no leader let the election begin
 
 		if maxTerm == -1 || maxTerm > currentTerm {
 			rf.mu.Lock()
@@ -351,8 +353,9 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 // confusing debug output. any goroutine with a long-running loop
 // should call killed() to check whether it should stop.
 func (rf *Raft) Kill() {
-
 	atomic.StoreInt32(&rf.dead, 1)
+
+	// Your code here, if desired.
 
 	fmt.Println("Got kill for", rf.me)
 	rf.mu.Lock()
@@ -371,10 +374,8 @@ func (rf *Raft) ticker() {
 
 		// Your code here (2A)
 		// Check if a leader election should be started.
-		// pause for a random amount of time between 50 and 350
-		// milliseconds.
 
-		ms := 50 + (rand.Int63() % 300)
+		ms := 200 + (rand.Int63() % 300)
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 
 		var lastLeaderCommunicationTime time.Time
@@ -386,8 +387,6 @@ func (rf *Raft) ticker() {
 		} else {
 			lastLeaderCommunicationTime = time.Now()
 		}
-
-		//Leader send heartbeat every 10ms, that means current server dint get any heartbeats from last 10 cycles
 
 		if time.Now().Sub(lastLeaderCommunicationTime).Milliseconds() >= 100 {
 
@@ -401,12 +400,11 @@ func (rf *Raft) ticker() {
 			rf.mu.Unlock()
 
 			//what happens when majority of servers are down? Should that case be handled?
-
 			//start election
+
 			var finished int = 0
 			var voteCount int = 1 //candidate votes for itself
 			var followerRespLock sync.Mutex
-			followerCondVar := sync.NewCond(&followerRespLock)
 
 			for peerItr := 0; peerItr < len(rf.peers); peerItr++ {
 
@@ -419,7 +417,6 @@ func (rf *Raft) ticker() {
 						ok := rf.sendRequestVote(peerId, &args, &reply)
 
 						followerRespLock.Lock()
-
 						if ok {
 
 							if reply.VoteGranted {
@@ -428,9 +425,6 @@ func (rf *Raft) ticker() {
 						}
 
 						finished += 1
-
-						followerCondVar.Broadcast()
-
 						followerRespLock.Unlock()
 
 					}(peerItr)
@@ -439,6 +433,7 @@ func (rf *Raft) ticker() {
 
 			var currentFinished int
 			var currentState serverState
+			var termBeforeElection int
 
 			followerRespLock.Lock()
 			currentFinished = finished
@@ -446,32 +441,37 @@ func (rf *Raft) ticker() {
 
 			rf.mu.Lock()
 			currentState = rf.currentSeverState
+			currentTerm = rf.currentTerm
+			termBeforeElection = rf.currentTerm
 			rf.mu.Unlock()
 
 			//we just need half of the servers to send votes to get the majority
-			for currentFinished < int(math.Ceil(float64((len(rf.peers)-1)/2.0))) && currentState == candidate {
+			for currentFinished < int(math.Ceil(float64((len(rf.peers)-1)/2.0))) && currentState == candidate && currentTerm == termBeforeElection {
+				time.Sleep(10 * time.Millisecond)
 
 				followerRespLock.Lock()
-				followerCondVar.Wait() //We are not locking followerRespLock until are waiting. internally condition variable unlocks it.
 				currentFinished = finished
 				followerRespLock.Unlock()
 
 				rf.mu.Lock()
 				currentState = rf.currentSeverState
+				currentTerm = rf.currentTerm
 				rf.mu.Unlock()
 
 			}
 
-			//validate election results only if this server is still candidate
-			if currentState == candidate {
+			//continue election only if this server is still candidate
+			if currentState == candidate && currentTerm == termBeforeElection {
 				followerRespLock.Lock()
 
 				var majorityCont int = int(math.Ceil(float64(len(rf.peers)) / 2.0))
 
 				if voteCount >= majorityCont {
 					rf.mu.Lock()
-					rf.currentSeverState = leader //term is already incremented just before starting the elecetion. No need to do it here. Just send all other servers AppendRPC call to gain the authority
+					rf.currentSeverState = leader
 					rf.mu.Unlock()
+
+					//fmt.Println("Received", voteCount, "votes out of", len(rf.peers), "for server", rf.me, "making it leader. Majority count", majorityCont)
 
 					go rf.heartBeatSender()
 
@@ -484,7 +484,7 @@ func (rf *Raft) ticker() {
 			}
 
 		} else {
-			time.Sleep(10 * time.Millisecond) //Got the heartbeat from leader and wait for 10 milliseconds before checking for last heartbeat sent time from leader again
+			time.Sleep(10 * time.Millisecond)
 		}
 	}
 }
