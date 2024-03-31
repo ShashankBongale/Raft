@@ -95,6 +95,8 @@ type Raft struct {
 
 	toBeCommittedEvent    int
 	eventReplicationCount map[int]int
+
+	committedIndex int
 }
 
 // example RequestVote RPC arguments structure.
@@ -288,13 +290,17 @@ func (rf *Raft) AppendEntry(args *AppendEntriesArgs, reply *AppendEntriesReply) 
 
 		}
 
-		//this has to checked again
-		if args.CommittedIndex != -1 {
-			applyMsg := ApplyMsg{CommandValid: true, Command: rf.committedEventLog[args.CommittedIndex].Command, CommandIndex: args.CommittedIndex + 1}
-			//fmt.Println("Follower server sending apply msg", applyMsg)
-			rf.applyCh <- applyMsg
+		var prevCommittedIndex int = rf.committedIndex
+
+		if rf.committedIndex < args.CommittedIndex {
+			rf.committedIndex = math.Min(args.CommittedIndex, len(rf.committedEventLog)-1)
 		}
 
+		for newCommittedLogItr := prevCommittedIndex; newCommittedLogItr <= rf.committedIndex; newCommittedLogItr++ {
+			applyMsg := ApplyMsg{CommandValid: true, Command: rf.committedEventLog[newCommittedLogItr].Command, CommandIndex: newCommittedLogItr + 1}
+			rf.applyCh <- applyMsg
+
+		}
 	}
 
 	rf.mu.Unlock()
@@ -694,6 +700,8 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	}
 
 	rf.toBeCommittedEvent = 0
+
+	rf.committedIndex = 0
 	// start ticker goroutine to start elections
 	go rf.ticker()
 
