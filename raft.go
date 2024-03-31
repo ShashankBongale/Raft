@@ -293,13 +293,15 @@ func (rf *Raft) AppendEntry(args *AppendEntriesArgs, reply *AppendEntriesReply) 
 		var prevCommittedIndex int = rf.committedIndex
 
 		if rf.committedIndex < args.CommittedIndex {
-			rf.committedIndex = math.Min(args.CommittedIndex, len(rf.committedEventLog)-1)
+			rf.committedIndex = int(math.Min(float64(args.CommittedIndex), float64(len(rf.committedEventLog)-1)))
 		}
 
-		for newCommittedLogItr := prevCommittedIndex; newCommittedLogItr <= rf.committedIndex; newCommittedLogItr++ {
-			applyMsg := ApplyMsg{CommandValid: true, Command: rf.committedEventLog[newCommittedLogItr].Command, CommandIndex: newCommittedLogItr + 1}
-			rf.applyCh <- applyMsg
+		if rf.committedIndex != -1 {
+			for newCommittedLogItr := prevCommittedIndex + 1; newCommittedLogItr <= rf.committedIndex; newCommittedLogItr++ {
+				applyMsg := ApplyMsg{CommandValid: true, Command: rf.committedEventLog[newCommittedLogItr].Command, CommandIndex: newCommittedLogItr + 1}
+				rf.applyCh <- applyMsg
 
+			}
 		}
 	}
 
@@ -701,7 +703,7 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 
 	rf.toBeCommittedEvent = 0
 
-	rf.committedIndex = 0
+	rf.committedIndex = -1
 	// start ticker goroutine to start elections
 	go rf.ticker()
 
