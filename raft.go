@@ -85,16 +85,16 @@ type Raft struct {
 	lastVotedTerm int
 	votedFor      int
 
+	applyCh chan ApplyMsg
+
 	//eventLog          []Event
 	committedEventLog []Event //should change this name
-	applitedEventLog  []Event //We might not need this
+	//applitedEventLog  []Event //We might not need this
 
 	nextIndexForPeers map[int]int
 
 	toBeCommittedEvent    int
 	eventReplicationCount map[int]int
-
-	applyCh chan ApplyMsg
 }
 
 // example RequestVote RPC arguments structure.
@@ -102,9 +102,10 @@ type Raft struct {
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
 
-	CandidateTerm                int
-	CandidateId                  int
-	CandidateCommittedEventCount int
+	CandidateTerm         int
+	CandidateId           int
+	CandidateLastLogIndex int
+	CandidateLastLogTerm  int
 }
 
 // example RequestVote RPC reply structure.
@@ -208,23 +209,28 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	rf.mu.Lock()
 
-	committedEventCount := len(rf.committedEventLog)
-	/*var lastCommittedLogTerm int = -1
+	if rf.killed() {
+		rf.mu.Unlock()
+		return
+	}
 
-	if committedEventCount > 0 {
-		lastCommittedLogTerm = rf.committedEventLog[committedEventCount-1].Term
-	}*/
+	committedEventCount := len(rf.committedEventLog)
+	lastLogIndex := committedEventCount - 1
+
+	lastLogTerm := -1
+	if lastLogIndex >= 0 {
+		lastLogTerm = rf.committedEventLog[lastLogIndex].Term
+	}
 
 	var isCandidateHasAllInfo bool = false
 
-	//Leader should have upto date info as of this server. This is election restriction in paper
-	if rf.currentTerm <= args.CandidateTerm && committedEventCount <= args.CandidateCommittedEventCount {
+	if lastLogTerm <= args.CandidateLastLogTerm && lastLogIndex <= args.CandidateLastLogIndex {
 		isCandidateHasAllInfo = true
 	}
 
 	if isCandidateHasAllInfo && rf.lastVotedTerm < args.CandidateTerm {
 		reply.VoteGranted = true
-		fmt.Println("Server", rf.me, "granting vote for", args.CandidateId, "for term", args.CandidateTerm)
+		fmt.Println("Server", rf.me, "granting vote for", args.CandidateId, "for term", args.CandidateTerm, "with data", rf.committedEventLog)
 		rf.lastVotedTerm = args.CandidateTerm
 		rf.votedFor = args.CandidateId
 	}
@@ -276,11 +282,13 @@ func (rf *Raft) AppendEntry(args *AppendEntriesArgs, reply *AppendEntriesReply) 
 		reply.IsRequestSuccessful = true
 
 		if args.NewCommand != "" {
+			fmt.Println("Server", rf.me, "got data", args.NewCommand)
 			newEvent := Event{Command: args.NewCommand, Term: currentTerm}
 			rf.committedEventLog = append(rf.committedEventLog, newEvent)
 
 		}
 
+		//this has to checked again
 		if args.CommittedIndex != -1 {
 			applyMsg := ApplyMsg{CommandValid: true, Command: rf.committedEventLog[args.CommittedIndex].Command, CommandIndex: args.CommittedIndex + 1}
 			//fmt.Println("Follower server sending apply msg", applyMsg)
@@ -379,7 +387,7 @@ func (rf *Raft) heartBeatSender() {
 				go func(peerId int, newCmd interface{}, preceedingIndex int, preceedingTerm int, preceedingCmd interface{}, committedIndex int) {
 
 					if newCmd != "" {
-						fmt.Println("Server", rf.me, "sending command for index", preceedingIndex+1, "to server", peerId)
+						fmt.Println("Server", rf.me, "sending command", newCmd, "for index", preceedingIndex+1, "to server", peerId)
 					}
 					args := AppendEntriesArgs{Term: rf.currentTerm, LeaderId: rf.me, NewCommand: newCmd, PreceedingIndex: preceedingIndex, PreceedingTerm: preceedingTerm /*PreceedingCommand: preceedingCmd, */, CommittedIndex: committedIndex}
 					reply := AppendEntriesReply{CurrentTerm: -1, IsRequestSuccessful: false}
@@ -422,6 +430,7 @@ func (rf *Raft) heartBeatSender() {
 		currentTerm = rf.currentTerm
 		rf.mu.Unlock()
 
+		//If any of the follower has greater term than this leader server, convert this server to follower
 		if maxTerm == -1 || maxTerm > currentTerm {
 			rf.mu.Lock()
 			rf.currentTerm = maxTerm
@@ -537,18 +546,29 @@ func (rf *Raft) ticker() {
 
 		if time.Now().Sub(lastLeaderCommunicationTime).Milliseconds() >= 100 {
 
-			fmt.Println("Starting election for server", rf.me)
+			fmt.Println("Starting election for server", rf.me, "with data", rf.committedEventLog)
 
 			var currentTerm int
 			var committedEventCount int
+			var lastLogIndex int = -1
+			var lastLogTerm int = -1
+
 			rf.mu.Lock()
+
 			rf.currentSeverState = candidate
 			rf.currentTerm += 1
 			currentTerm = rf.currentTerm
 			committedEventCount = len(rf.committedEventLog)
+
+			if committedEventCount > 0 {
+				lastLogTerm = rf.committedEventLog[committedEventCount-1].Term
+				lastLogIndex = committedEventCount - 1
+			}
+
 			rf.mu.Unlock()
 
 			//what happens when majority of servers are down? Should that case be handled?
+			//In this case candidate will never win the election. So no leader in the system and system fails
 			//start election
 
 			var finished int = 0
@@ -561,7 +581,7 @@ func (rf *Raft) ticker() {
 
 					go func(peerId int) {
 
-						args := RequestVoteArgs{CandidateTerm: currentTerm, CandidateId: rf.me, CandidateCommittedEventCount: committedEventCount}
+						args := RequestVoteArgs{CandidateTerm: currentTerm, CandidateId: rf.me, CandidateLastLogIndex: lastLogIndex, CandidateLastLogTerm: lastLogTerm}
 						reply := RequestVoteReply{VoteGranted: false}
 						ok := rf.sendRequestVote(peerId, &args, &reply)
 
@@ -618,6 +638,7 @@ func (rf *Raft) ticker() {
 				if voteCount >= majorityCont {
 					rf.mu.Lock()
 					rf.currentSeverState = leader
+					fmt.Println("Server", rf.me, "is leader")
 					rf.mu.Unlock()
 
 					//fmt.Println("Received", voteCount, "votes out of", len(rf.peers), "for server", rf.me, "making it leader. Majority count", majorityCont)
@@ -647,8 +668,8 @@ func (rf *Raft) ticker() {
 // tester or service expects Raft to send ApplyMsg messages.
 // Make() must return quickly, so it should start goroutines
 // for any long-running work.
-func Make(peers []*labrpc.ClientEnd, me int,
-	persister *Persister, applyCh chan ApplyMsg) *Raft {
+func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan ApplyMsg) *Raft {
+
 	rf := &Raft{}
 	rf.peers = peers
 	rf.persister = persister
@@ -656,12 +677,12 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.applyCh = applyCh
 
 	// Your initialization code here (2A, 2B, 2C).
-
 	rf.currentTerm = 0
 	rf.currentSeverState = follower
 	rf.lastLeaderComTime = time.Time{}
 	rf.votedFor = -1
 	rf.lastVotedTerm = -1
+
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
