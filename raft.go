@@ -87,14 +87,14 @@ type Raft struct {
 
 	applyCh chan ApplyMsg
 
-	//eventLog          []Event
 	committedEventLog []Event //should change this name
-	//applitedEventLog  []Event //We might not need this
 
 	nextIndexForPeers map[int]int
 
-	toBeCommittedEvent    int
-	eventReplicationCount map[int]int
+	toBeCommittedEvent int
+	//eventReplicationCount map[int]int
+
+	matchIndex map[int]int
 
 	committedIndex int
 }
@@ -251,8 +251,11 @@ func (rf *Raft) AppendEntry(args *AppendEntriesArgs, reply *AppendEntriesReply) 
 	currentTerm = rf.currentTerm
 	currentState = rf.currentSeverState
 
-	//fmt.Println("Got append request from server", args.LeaderId, "with term", args.Term, "for server", rf.me, "with term", rf.currentTerm)
+	rf.mu.Unlock()
 
+	fmt.Println("Got append request from server", args.LeaderId, "with term", args.Term, "for server", rf.me, "with term", currentTerm)
+
+	rf.mu.Lock()
 	if currentTerm <= args.Term {
 
 		rf.currentTerm = args.Term
@@ -284,7 +287,7 @@ func (rf *Raft) AppendEntry(args *AppendEntriesArgs, reply *AppendEntriesReply) 
 		reply.IsRequestSuccessful = true
 
 		if args.NewCommand != "" {
-			fmt.Println("Server", rf.me, "got data", args.NewCommand)
+			fmt.Println("Server", rf.me, "got data", args.NewCommand, "at time", rf.lastLeaderComTime)
 			newEvent := Event{Command: args.NewCommand, Term: currentTerm}
 			rf.committedEventLog = append(rf.committedEventLog, newEvent)
 
@@ -364,6 +367,9 @@ func (rf *Raft) heartBeatSender() {
 		var maxTermLock sync.Mutex
 		var wg sync.WaitGroup
 
+		var serversResponded = 0
+		var serversRespLock sync.Mutex
+
 		for peerItr := 0; peerItr < len(rf.peers); peerItr++ {
 			if peerItr != rf.me {
 				wg.Add(1)
@@ -397,16 +403,24 @@ func (rf *Raft) heartBeatSender() {
 					if newCmd != "" {
 						fmt.Println("Server", rf.me, "sending command", newCmd, "for index", preceedingIndex+1, "to server", peerId)
 					}
+
 					args := AppendEntriesArgs{Term: rf.currentTerm, LeaderId: rf.me, NewCommand: newCmd, PreceedingIndex: preceedingIndex, PreceedingTerm: preceedingTerm /*PreceedingCommand: preceedingCmd, */, CommittedIndex: committedIndex}
 					reply := AppendEntriesReply{CurrentTerm: -1, IsRequestSuccessful: false}
 
+					wg.Done()
+
 					ok := rf.sendAppendEntries(peerId, &args, &reply)
+
 					if ok {
 						maxTermLock.Lock()
 						if reply.CurrentTerm > maxTerm {
 							maxTerm = reply.CurrentTerm
 						}
 						maxTermLock.Unlock()
+
+						serversRespLock.Lock()
+						serversResponded += 1
+						serversRespLock.Unlock()
 
 						if newCmd != "" {
 							if !reply.IsRequestSuccessful {
@@ -419,47 +433,68 @@ func (rf *Raft) heartBeatSender() {
 								rf.mu.Unlock()
 							} else {
 								rf.mu.Lock()
-								rf.eventReplicationCount[rf.nextIndexForPeers[peerId]] += 1
+								//rf.eventReplicationCount[rf.nextIndexForPeers[peerId]] += 1
+								rf.matchIndex[peerId] = rf.nextIndexForPeers[peerId]
 								rf.nextIndexForPeers[peerId] += 1
 								rf.mu.Unlock()
 							}
 						}
 					}
-					wg.Done()
+					//wg.Done()
 				}(peerItr, newCmd, preceedingIndex, preceedingTerm, preceedingCommand, committedIndex)
 			}
 		}
 
-		wg.Wait()
+		wg.Wait() //should we wait for all of them to respond. We need only half of them to respond to get the majority
 
-		var currentTerm int
+		//var currentTerm int
 
 		rf.mu.Lock()
-		currentTerm = rf.currentTerm
+		//currentTerm = rf.currentTerm
+		currentState := rf.currentSeverState
 		rf.mu.Unlock()
 
 		//If any of the follower has greater term than this leader server, convert this server to follower
-		if maxTerm == -1 || maxTerm > currentTerm {
+		/*if maxTerm == -1 || maxTerm > currentTerm {
 			rf.mu.Lock()
 			rf.currentTerm = maxTerm
 			rf.currentSeverState = follower
 			rf.mu.Unlock()
 			return
+		}*/
+
+		for serversResponded < int(math.Ceil(float64((len(rf.peers)-1)/2.0))) && currentState == leader {
+			time.Sleep(1 * time.Millisecond)
+
+			rf.mu.Lock()
+			currentState = rf.currentSeverState
+			rf.mu.Unlock()
 		}
 
 		rf.mu.Lock()
-		if len(rf.committedEventLog) > 0 && rf.eventReplicationCount[rf.toBeCommittedEvent] >= int(math.Ceil(float64((len(rf.peers))/2.0))) {
 
-			fmt.Println("Command committed by server", rf.me, "for index", rf.toBeCommittedEvent)
-			applyMsg := ApplyMsg{CommandValid: true, Command: rf.committedEventLog[rf.toBeCommittedEvent].Command, CommandIndex: rf.toBeCommittedEvent + 1}
+		for {
+			serversWithReplica := 0
 
-			//fmt.Println("Leader server sending apply msg", applyMsg)
+			for _, latestLog := range rf.matchIndex {
+				if latestLog >= rf.toBeCommittedEvent {
+					serversWithReplica += 1
+				}
+			}
 
-			rf.applyCh <- applyMsg
+			if serversWithReplica >= int(math.Ceil(float64((len(rf.peers))/2.0))) {
 
-			rf.toBeCommittedEvent += 1
+				applyMsg := ApplyMsg{CommandValid: true, Command: rf.committedEventLog[rf.toBeCommittedEvent].Command, CommandIndex: rf.toBeCommittedEvent + 1}
 
+				rf.applyCh <- applyMsg
+				fmt.Println("Command committed by server", rf.me, "for index", rf.toBeCommittedEvent)
+				rf.toBeCommittedEvent += 1
+
+			} else {
+				break
+			}
 		}
+
 		rf.mu.Unlock()
 
 		time.Sleep(10 * time.Millisecond)
@@ -500,7 +535,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	var newEvent Event = Event{Command: command, Term: term}
 	rf.committedEventLog = append(rf.committedEventLog, newEvent)
 	index = len(rf.committedEventLog) - 1
-	rf.eventReplicationCount[index] = 1
+	rf.matchIndex[rf.me] = index
 	fmt.Println("Got data for index", index, "for server", rf.me)
 	rf.mu.Unlock()
 
@@ -554,7 +589,7 @@ func (rf *Raft) ticker() {
 
 		if time.Now().Sub(lastLeaderCommunicationTime).Milliseconds() >= 100 {
 
-			fmt.Println("Starting election for server", rf.me, "with data", rf.committedEventLog)
+			fmt.Println("Starting election for server", rf.me, "with data", rf.committedEventLog, "last leader com time", lastLeaderCommunicationTime, "time now", time.Now())
 
 			var currentTerm int
 			var committedEventCount int
@@ -647,9 +682,17 @@ func (rf *Raft) ticker() {
 					rf.mu.Lock()
 					rf.currentSeverState = leader
 					fmt.Println("Server", rf.me, "is leader")
-					rf.mu.Unlock()
 
-					//fmt.Println("Received", voteCount, "votes out of", len(rf.peers), "for server", rf.me, "making it leader. Majority count", majorityCont)
+					if len(rf.committedEventLog) > 0 {
+						for peerItr := 0; peerItr < len(rf.peers); peerItr++ {
+							rf.nextIndexForPeers[peerItr] = len(rf.committedEventLog)
+							rf.matchIndex[peerItr] = -1
+						}
+
+						rf.matchIndex[rf.me] = len(rf.committedEventLog) - 1
+					}
+
+					rf.mu.Unlock()
 
 					go rf.heartBeatSender()
 
@@ -695,10 +738,12 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	rf.readPersist(persister.ReadRaftState())
 
 	rf.nextIndexForPeers = make(map[int]int)
-	rf.eventReplicationCount = make(map[int]int)
+	//rf.eventReplicationCount = make(map[int]int)
+	rf.matchIndex = make(map[int]int)
 
 	for peerItr := 0; peerItr < len(peers); peerItr++ {
 		rf.nextIndexForPeers[peerItr] = 0
+		rf.matchIndex[peerItr] = -1
 	}
 
 	rf.toBeCommittedEvent = 0
