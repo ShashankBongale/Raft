@@ -18,7 +18,6 @@ package raft
 //
 
 import (
-	//	"bytes"
 	"fmt"
 	"math"
 	"math/rand"
@@ -26,7 +25,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	//	"6.5840/labgob"
 	"6.5840/labrpc"
 )
 
@@ -73,30 +71,23 @@ type Raft struct {
 	me        int                 // this peer's index into peers[]
 	dead      int32               // set by Kill()
 
-	// Your data here (2A, 2B, 2C).
-	// Look at the paper's Figure 2 for a description of what
-	// state a Raft server must maintain.
+	applyCh           chan ApplyMsg
+	committedEventLog []Event //should change this name
 
 	currentTerm       int
 	currentSeverState serverState
 
+	//follower variables
 	lastLeaderComTime time.Time
+	lastVotedTerm     int
+	votedFor          int
 
-	lastVotedTerm int
-	votedFor      int
-
-	applyCh chan ApplyMsg
-
-	committedEventLog []Event //should change this name
-
+	//leader vairables
 	nextIndexForPeers map[int]int
+	matchIndex        map[int]int
 
-	toBeCommittedEvent int
-	//eventReplicationCount map[int]int
-
-	matchIndex map[int]int
-
-	committedIndex int
+	toBeCommittedEvent int //Do we require both of these variable? Looks redundant
+	committedIndex     int
 }
 
 // example RequestVote RPC arguments structure.
@@ -124,7 +115,6 @@ type AppendEntriesArgs struct {
 
 	PreceedingIndex int
 	PreceedingTerm  int
-	//PreceedingCommand interface{}
 
 	CommittedIndex int
 }
@@ -138,12 +128,8 @@ type AppendEntriesReply struct {
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
 
-	//rf.currentSeverState
-	//fmt.Println("Checking status for server", rf.me)
 	var term int = -1
 	var isleader bool = false
-
-	// Your code here (2A).
 
 	if !rf.killed() {
 		rf.mu.Lock()
@@ -152,7 +138,6 @@ func (rf *Raft) GetState() (int, bool) {
 		rf.mu.Unlock()
 	}
 
-	//fmt.Println("Server", rf.me, "is in leader state:", isleader, "with term", term)
 	return term, isleader
 }
 
@@ -203,21 +188,27 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 
 }
 
+func (rf *Raft) GetLastLogIndex() int {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	return len(rf.committedEventLog) - 1
+}
+
 // example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 
 	reply.VoteGranted = false
 
-	rf.mu.Lock()
-
 	if rf.killed() {
-		rf.mu.Unlock()
 		return
 	}
 
-	committedEventCount := len(rf.committedEventLog)
-	lastLogIndex := committedEventCount - 1
+	lastLogIndex := rf.GetLastLogIndex()
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
 	lastLogTerm := -1
 	if lastLogIndex >= 0 {
@@ -236,8 +227,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.lastVotedTerm = args.CandidateTerm
 		rf.votedFor = args.CandidateId
 	}
-
-	rf.mu.Unlock()
 }
 
 func (rf *Raft) AppendEntry(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -253,9 +242,11 @@ func (rf *Raft) AppendEntry(args *AppendEntriesArgs, reply *AppendEntriesReply) 
 
 	rf.mu.Unlock()
 
-	fmt.Println("Got append request from server", args.LeaderId, "with term", args.Term, "for server", rf.me, "with term", currentTerm)
+	//fmt.Println("Got append request from server", args.LeaderId, "with term", args.Term, "for server", rf.me, "with term", currentTerm)
 
 	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
 	if currentTerm <= args.Term {
 
 		rf.currentTerm = args.Term
@@ -275,10 +266,9 @@ func (rf *Raft) AppendEntry(args *AppendEntriesArgs, reply *AppendEntriesReply) 
 		if logEntryCount > 0 {
 			lastEvent := rf.committedEventLog[logEntryCount-1]
 
-			if lastEvent.Term != args.PreceedingTerm || logEntryCount-1 != args.PreceedingIndex /*|| lastEvent.Command != args.PreceedingCommand*/ {
+			if lastEvent.Term != args.PreceedingTerm || logEntryCount-1 != args.PreceedingIndex {
 				reply.IsRequestSuccessful = false
 
-				rf.mu.Unlock()
 				return
 			}
 		}
@@ -287,7 +277,7 @@ func (rf *Raft) AppendEntry(args *AppendEntriesArgs, reply *AppendEntriesReply) 
 		reply.IsRequestSuccessful = true
 
 		if args.NewCommand != "" {
-			fmt.Println("Server", rf.me, "got data", args.NewCommand, "at time", rf.lastLeaderComTime)
+			fmt.Println("Server", rf.me, "got data", args.NewCommand)
 			newEvent := Event{Command: args.NewCommand, Term: currentTerm}
 			rf.committedEventLog = append(rf.committedEventLog, newEvent)
 
@@ -307,8 +297,6 @@ func (rf *Raft) AppendEntry(args *AppendEntriesArgs, reply *AppendEntriesReply) 
 			}
 		}
 	}
-
-	rf.mu.Unlock()
 
 }
 
@@ -401,7 +389,7 @@ func (rf *Raft) heartBeatSender() {
 				go func(peerId int, newCmd interface{}, preceedingIndex int, preceedingTerm int, preceedingCmd interface{}, committedIndex int) {
 
 					if newCmd != "" {
-						fmt.Println("Server", rf.me, "sending command", newCmd, "for index", preceedingIndex+1, "to server", peerId)
+						//fmt.Println("Server", rf.me, "sending command", newCmd, "for index", preceedingIndex+1, "to server", peerId)
 					}
 
 					args := AppendEntriesArgs{Term: rf.currentTerm, LeaderId: rf.me, NewCommand: newCmd, PreceedingIndex: preceedingIndex, PreceedingTerm: preceedingTerm /*PreceedingCommand: preceedingCmd, */, CommittedIndex: committedIndex}
@@ -410,6 +398,10 @@ func (rf *Raft) heartBeatSender() {
 					wg.Done()
 
 					ok := rf.sendAppendEntries(peerId, &args, &reply)
+
+					/*if rf.currentSeverState == leader {
+						fmt.Println("Peer", peerId, "responded")
+					}*/
 
 					if ok {
 						maxTermLock.Lock()
@@ -427,7 +419,7 @@ func (rf *Raft) heartBeatSender() {
 								rf.mu.Lock()
 
 								if rf.nextIndexForPeers[peerId] != 0 {
-									rf.nextIndexForPeers[peerId] -= 1
+									rf.nextIndexForPeers[peerId] = preceedingIndex
 								}
 
 								rf.mu.Unlock()
@@ -435,7 +427,7 @@ func (rf *Raft) heartBeatSender() {
 								rf.mu.Lock()
 								//rf.eventReplicationCount[rf.nextIndexForPeers[peerId]] += 1
 								rf.matchIndex[peerId] = rf.nextIndexForPeers[peerId]
-								rf.nextIndexForPeers[peerId] += 1
+								rf.nextIndexForPeers[peerId] = preceedingIndex + 2
 								rf.mu.Unlock()
 							}
 						}
@@ -473,8 +465,10 @@ func (rf *Raft) heartBeatSender() {
 
 		rf.mu.Lock()
 
+		serversWithReplica := 0
+
 		for {
-			serversWithReplica := 0
+			serversWithReplica = 0
 
 			for _, latestLog := range rf.matchIndex {
 				if latestLog >= rf.toBeCommittedEvent {
@@ -487,7 +481,7 @@ func (rf *Raft) heartBeatSender() {
 				applyMsg := ApplyMsg{CommandValid: true, Command: rf.committedEventLog[rf.toBeCommittedEvent].Command, CommandIndex: rf.toBeCommittedEvent + 1}
 
 				rf.applyCh <- applyMsg
-				fmt.Println("Command committed by server", rf.me, "for index", rf.toBeCommittedEvent)
+				fmt.Println("Command", rf.committedEventLog[rf.toBeCommittedEvent].Command, "committed by server", rf.me, "for index", rf.toBeCommittedEvent)
 				rf.toBeCommittedEvent += 1
 
 			} else {
@@ -536,7 +530,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.committedEventLog = append(rf.committedEventLog, newEvent)
 	index = len(rf.committedEventLog) - 1
 	rf.matchIndex[rf.me] = index
-	fmt.Println("Got data for index", index, "for server", rf.me)
+	fmt.Println("Got data", command, "for index", index, "for server", rf.me)
 	rf.mu.Unlock()
 
 	return index + 1, term, isLeader
@@ -557,9 +551,37 @@ func (rf *Raft) Kill() {
 	// Your code here, if desired.
 
 	fmt.Println("Got kill for", rf.me)
+
 	rf.mu.Lock()
-	rf.currentSeverState = killed
+
+	/*rf.currentSeverState = killed
 	rf.currentTerm = -1
+
+	rf.committedEventLog = nil
+	rf.nextIndexForPeers = nil
+	rf.matchIndex = nil*/
+
+	rf.currentTerm = -1
+	rf.currentSeverState = killed
+	rf.lastLeaderComTime = time.Time{}
+	rf.votedFor = -1
+	rf.lastVotedTerm = -1
+
+	// initialize from state persisted before a crash
+	//rf.readPersist(persister.ReadRaftState())
+
+	rf.nextIndexForPeers = nil
+	rf.matchIndex = nil
+
+	/*for peerItr := 0; peerItr < len(peers); peerItr++ {
+		rf.nextIndexForPeers[peerItr] = 0
+		rf.matchIndex[peerItr] = -1
+	}*/
+
+	rf.toBeCommittedEvent = 0
+
+	rf.committedIndex = -1
+
 	rf.mu.Unlock()
 }
 
@@ -589,7 +611,7 @@ func (rf *Raft) ticker() {
 
 		if time.Now().Sub(lastLeaderCommunicationTime).Milliseconds() >= 100 {
 
-			fmt.Println("Starting election for server", rf.me, "with data", rf.committedEventLog, "last leader com time", lastLeaderCommunicationTime, "time now", time.Now())
+			fmt.Println("Starting election for server", rf.me, "with data", rf.committedEventLog)
 
 			var currentTerm int
 			var committedEventCount int
