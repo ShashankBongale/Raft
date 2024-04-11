@@ -245,7 +245,6 @@ func (rf *Raft) AppendEntry(args *AppendEntriesArgs, reply *AppendEntriesReply) 
 	//fmt.Println("Got append request from server", args.LeaderId, "with term", args.Term, "for server", rf.me, "with term", currentTerm)
 
 	rf.mu.Lock()
-	defer rf.mu.Unlock()
 
 	if currentTerm <= args.Term {
 
@@ -257,7 +256,27 @@ func (rf *Raft) AppendEntry(args *AppendEntriesArgs, reply *AppendEntriesReply) 
 		}
 	}
 
+	currentState = rf.currentSeverState
+
+	rf.mu.Unlock()
+
+	//dont respond anything as we are in middle of this election. Need to double check this logic.
+	for currentState == candidate {
+		time.Sleep(1 * time.Microsecond)
+
+		rf.mu.Lock()
+		currentState = rf.currentSeverState
+		rf.mu.Unlock()
+	}
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
 	reply.CurrentTerm = currentTerm
+
+	if args.NewCommand != "" {
+		fmt.Println("Server", rf.me, "with state", rf.committedEventLog, rf.currentSeverState, "got data", args)
+	}
 
 	if rf.currentSeverState == follower {
 		logEntryCount := len(rf.committedEventLog)
@@ -277,7 +296,7 @@ func (rf *Raft) AppendEntry(args *AppendEntriesArgs, reply *AppendEntriesReply) 
 		reply.IsRequestSuccessful = true
 
 		if args.NewCommand != "" {
-			fmt.Println("Server", rf.me, "got data", args.NewCommand)
+			//fmt.Println("Server", rf.me, "got data", args.NewCommand)
 			newEvent := Event{Command: args.NewCommand, Term: currentTerm}
 			rf.committedEventLog = append(rf.committedEventLog, newEvent)
 
@@ -389,7 +408,7 @@ func (rf *Raft) heartBeatSender() {
 				go func(peerId int, newCmd interface{}, preceedingIndex int, preceedingTerm int, preceedingCmd interface{}, committedIndex int) {
 
 					if newCmd != "" {
-						//fmt.Println("Server", rf.me, "sending command", newCmd, "for index", preceedingIndex+1, "to server", peerId)
+						fmt.Println("Server", rf.me, "sending command", newCmd, "for index", preceedingIndex+1, "to server", peerId)
 					}
 
 					args := AppendEntriesArgs{Term: rf.currentTerm, LeaderId: rf.me, NewCommand: newCmd, PreceedingIndex: preceedingIndex, PreceedingTerm: preceedingTerm /*PreceedingCommand: preceedingCmd, */, CommittedIndex: committedIndex}
@@ -399,9 +418,9 @@ func (rf *Raft) heartBeatSender() {
 
 					ok := rf.sendAppendEntries(peerId, &args, &reply)
 
-					/*if rf.currentSeverState == leader {
+					if rf.currentSeverState == leader && ok && newCmd != "" {
 						fmt.Println("Peer", peerId, "responded")
-					}*/
+					}
 
 					if ok {
 						maxTermLock.Lock()
@@ -425,7 +444,6 @@ func (rf *Raft) heartBeatSender() {
 								rf.mu.Unlock()
 							} else {
 								rf.mu.Lock()
-								//rf.eventReplicationCount[rf.nextIndexForPeers[peerId]] += 1
 								rf.matchIndex[peerId] = rf.nextIndexForPeers[peerId]
 								rf.nextIndexForPeers[peerId] = preceedingIndex + 2
 								rf.mu.Unlock()
@@ -681,7 +699,7 @@ func (rf *Raft) ticker() {
 
 			//we just need half of the servers to send votes to get the majority
 			for currentFinished < int(math.Ceil(float64((len(rf.peers)-1)/2.0))) && currentState == candidate && currentTerm == termBeforeElection {
-				time.Sleep(10 * time.Millisecond)
+				time.Sleep(1 * time.Microsecond)
 
 				followerRespLock.Lock()
 				currentFinished = finished
@@ -721,6 +739,8 @@ func (rf *Raft) ticker() {
 				} else {
 					rf.mu.Lock()
 					rf.currentSeverState = follower
+					rf.currentTerm = termBeforeElection - 1
+					fmt.Println("Server", rf.me, "lost election. Reverting backup to follower with term", rf.currentTerm)
 					rf.mu.Unlock()
 				}
 				followerRespLock.Unlock()
