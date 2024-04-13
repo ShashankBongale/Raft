@@ -272,6 +272,7 @@ func (rf *Raft) AppendEntry(args *AppendEntriesArgs, reply *AppendEntriesReply) 
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
+	currentTerm = rf.currentTerm
 	reply.CurrentTerm = currentTerm
 
 	if args.NewCommand != "" {
@@ -284,6 +285,12 @@ func (rf *Raft) AppendEntry(args *AppendEntriesArgs, reply *AppendEntriesReply) 
 		//Consistency check
 		if logEntryCount > 0 {
 			lastEvent := rf.committedEventLog[logEntryCount-1]
+
+			//if follower is ahead than leader at this fraction of moment return successful
+			if args.PreceedingIndex < logEntryCount-1 {
+				reply.IsRequestSuccessful = true
+				return
+			}
 
 			if lastEvent.Term != args.PreceedingTerm || logEntryCount-1 != args.PreceedingIndex {
 				reply.IsRequestSuccessful = false
@@ -381,13 +388,13 @@ func (rf *Raft) heartBeatSender() {
 			if peerItr != rf.me {
 				wg.Add(1)
 
-				preceedingIndex := -1
+				/*preceedingIndex := -1
 				preceedingTerm := -1
 				var preceedingCommand interface{}
 				var newCmd interface{} = ""
-				committedIndex := -1
+				committedIndex := -1*/
 
-				rf.mu.Lock()
+				/*rf.mu.Lock()
 
 				if rf.nextIndexForPeers[peerItr] != 0 {
 					preceedingIndex = rf.nextIndexForPeers[peerItr] - 1
@@ -403,13 +410,37 @@ func (rf *Raft) heartBeatSender() {
 					committedIndex = rf.toBeCommittedEvent - 1
 				}
 
-				rf.mu.Unlock()
+				rf.mu.Unlock()*/
 
-				go func(peerId int, newCmd interface{}, preceedingIndex int, preceedingTerm int, preceedingCmd interface{}, committedIndex int) {
+				go func(peerId int /*, newCmd interface{}, preceedingIndex int, preceedingTerm int, preceedingCmd interface{}, committedIndex int*/) {
 
-					if newCmd != "" {
-						fmt.Println("Server", rf.me, "sending command", newCmd, "for index", preceedingIndex+1, "to server", peerId)
+					preceedingIndex := -1
+					preceedingTerm := -1
+					//var preceedingCommand interface{}
+					var newCmd interface{} = ""
+					committedIndex := -1
+
+					rf.mu.Lock()
+
+					if rf.nextIndexForPeers[peerId] != 0 {
+						preceedingIndex = rf.nextIndexForPeers[peerId] - 1
+						preceedingTerm = rf.committedEventLog[preceedingIndex].Term
+						//preceedingCommand = rf.committedEventLog[preceedingIndex].Command
 					}
+
+					if rf.nextIndexForPeers[peerId] < len(rf.committedEventLog) {
+						newCmd = rf.committedEventLog[rf.nextIndexForPeers[peerId]].Command
+					}
+
+					if rf.toBeCommittedEvent > 0 {
+						committedIndex = rf.toBeCommittedEvent - 1
+					}
+
+					rf.mu.Unlock()
+
+					/*if newCmd != "" {
+						fmt.Println("Server", rf.me, "sending command", newCmd, "for index", preceedingIndex+1, "to server", peerId)
+					}*/
 
 					args := AppendEntriesArgs{Term: rf.currentTerm, LeaderId: rf.me, NewCommand: newCmd, PreceedingIndex: preceedingIndex, PreceedingTerm: preceedingTerm /*PreceedingCommand: preceedingCmd, */, CommittedIndex: committedIndex}
 					reply := AppendEntriesReply{CurrentTerm: -1, IsRequestSuccessful: false}
@@ -451,7 +482,7 @@ func (rf *Raft) heartBeatSender() {
 						}
 					}
 					//wg.Done()
-				}(peerItr, newCmd, preceedingIndex, preceedingTerm, preceedingCommand, committedIndex)
+				}(peerItr /*, newCmd, preceedingIndex, preceedingTerm, preceedingCommand, committedIndex*/)
 			}
 		}
 
@@ -740,7 +771,7 @@ func (rf *Raft) ticker() {
 					rf.mu.Lock()
 					rf.currentSeverState = follower
 					rf.currentTerm = termBeforeElection - 1
-					fmt.Println("Server", rf.me, "lost election. Reverting backup to follower with term", rf.currentTerm)
+					fmt.Println("Server", rf.me, "lost election. Reverting back to follower with term", rf.currentTerm)
 					rf.mu.Unlock()
 				}
 				followerRespLock.Unlock()
