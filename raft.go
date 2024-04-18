@@ -122,6 +122,7 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	CurrentTerm         int
 	IsRequestSuccessful bool
+	ServerState         serverState
 }
 
 // return currentTerm and whether this server
@@ -261,12 +262,23 @@ func (rf *Raft) AppendEntry(args *AppendEntriesArgs, reply *AppendEntriesReply) 
 	rf.mu.Unlock()
 
 	//dont respond anything as we are in middle of this election. Need to double check this logic.
-	for currentState == candidate {
+	/*for currentState == candidate {
 		time.Sleep(1 * time.Microsecond)
 
 		rf.mu.Lock()
 		currentState = rf.currentSeverState
+		rf.lastLeaderComTime = time.Now()
 		rf.mu.Unlock()
+	}*/
+
+	if currentState == candidate {
+		rf.mu.Lock()
+		reply.CurrentTerm = rf.currentTerm - 1
+		reply.IsRequestSuccessful = false
+		reply.ServerState = candidate
+		rf.mu.Unlock()
+		fmt.Println("Server", rf.me, "is candidate returning")
+		return
 	}
 
 	rf.mu.Lock()
@@ -322,6 +334,8 @@ func (rf *Raft) AppendEntry(args *AppendEntriesArgs, reply *AppendEntriesReply) 
 
 			}
 		}
+
+		rf.lastLeaderComTime = time.Now()
 	}
 
 }
@@ -450,7 +464,7 @@ func (rf *Raft) heartBeatSender() {
 					ok := rf.sendAppendEntries(peerId, &args, &reply)
 
 					if rf.currentSeverState == leader && ok && newCmd != "" {
-						fmt.Println("Peer", peerId, "responded")
+						fmt.Println("Peer", peerId, "responded for command", newCmd)
 					}
 
 					if ok {
@@ -466,13 +480,16 @@ func (rf *Raft) heartBeatSender() {
 
 						if newCmd != "" {
 							if !reply.IsRequestSuccessful {
-								rf.mu.Lock()
 
-								if rf.nextIndexForPeers[peerId] != 0 {
-									rf.nextIndexForPeers[peerId] = preceedingIndex
+								if reply.ServerState != candidate {
+									rf.mu.Lock()
+
+									if rf.nextIndexForPeers[peerId] != 0 {
+										rf.nextIndexForPeers[peerId] = preceedingIndex
+									}
+
+									rf.mu.Unlock()
 								}
-
-								rf.mu.Unlock()
 							} else {
 								rf.mu.Lock()
 								rf.matchIndex[peerId] = rf.nextIndexForPeers[peerId]
@@ -505,7 +522,7 @@ func (rf *Raft) heartBeatSender() {
 		}*/
 
 		for serversResponded < int(math.Ceil(float64((len(rf.peers)-1)/2.0))) && currentState == leader {
-			time.Sleep(1 * time.Millisecond)
+			time.Sleep(30 * time.Microsecond)
 
 			rf.mu.Lock()
 			currentState = rf.currentSeverState
@@ -514,13 +531,20 @@ func (rf *Raft) heartBeatSender() {
 
 		rf.mu.Lock()
 
+		if rf.currentSeverState != leader {
+			rf.mu.Unlock()
+			return
+		}
+
 		serversWithReplica := 0
 
 		for {
+
 			serversWithReplica = 0
 
-			for _, latestLog := range rf.matchIndex {
+			for peerId, latestLog := range rf.matchIndex {
 				if latestLog >= rf.toBeCommittedEvent {
+					fmt.Println("peer Id", peerId, "has match index", latestLog, "To be committed event count", rf.toBeCommittedEvent)
 					serversWithReplica += 1
 				}
 			}
@@ -540,7 +564,7 @@ func (rf *Raft) heartBeatSender() {
 
 		rf.mu.Unlock()
 
-		time.Sleep(10 * time.Millisecond)
+		time.Sleep(5 * time.Millisecond)
 
 		rf.mu.Lock()
 		currentServerState = rf.currentSeverState
@@ -681,11 +705,9 @@ func (rf *Raft) ticker() {
 
 			rf.mu.Unlock()
 
-			//what happens when majority of servers are down? Should that case be handled?
-			//In this case candidate will never win the election. So no leader in the system and system fails
 			//start election
 
-			var finished int = 0
+			var finished int = 1
 			var voteCount int = 1 //candidate votes for itself
 			var followerRespLock sync.Mutex
 
@@ -715,11 +737,13 @@ func (rf *Raft) ticker() {
 			}
 
 			var currentFinished int
+			var currentVoteCount int
 			var currentState serverState
 			var termBeforeElection int
 
 			followerRespLock.Lock()
 			currentFinished = finished
+			currentVoteCount = voteCount
 			followerRespLock.Unlock()
 
 			rf.mu.Lock()
@@ -729,11 +753,12 @@ func (rf *Raft) ticker() {
 			rf.mu.Unlock()
 
 			//we just need half of the servers to send votes to get the majority
-			for currentFinished < int(math.Ceil(float64((len(rf.peers)-1)/2.0))) && currentState == candidate && currentTerm == termBeforeElection {
+			for currentFinished < len(rf.peers) && currentVoteCount < int(math.Ceil(float64(len(rf.peers))/2.0)) && currentState == candidate && currentTerm == termBeforeElection {
 				time.Sleep(1 * time.Microsecond)
 
 				followerRespLock.Lock()
 				currentFinished = finished
+				currentVoteCount = voteCount
 				followerRespLock.Unlock()
 
 				rf.mu.Lock()
@@ -775,6 +800,8 @@ func (rf *Raft) ticker() {
 					rf.mu.Unlock()
 				}
 				followerRespLock.Unlock()
+			} else {
+				return
 			}
 
 		} else {
