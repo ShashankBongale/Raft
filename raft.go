@@ -88,6 +88,8 @@ type Raft struct {
 
 	toBeCommittedEvent int //Do we require both of these variable? Looks redundant
 	committedIndex     int
+
+	majorityCount int
 }
 
 // example RequestVote RPC arguments structure.
@@ -252,6 +254,7 @@ func (rf *Raft) AppendEntry(args *AppendEntriesArgs, reply *AppendEntriesReply) 
 		rf.currentTerm = args.Term
 		currentTerm = args.Term
 
+		//If this server receives event from a higher term leader accept it
 		if currentState == candidate || currentState == leader {
 			rf.currentSeverState = follower
 		}
@@ -261,19 +264,11 @@ func (rf *Raft) AppendEntry(args *AppendEntriesArgs, reply *AppendEntriesReply) 
 
 	rf.mu.Unlock()
 
-	//dont respond anything as we are in middle of this election. Need to double check this logic.
-	/*for currentState == candidate {
-		time.Sleep(1 * time.Microsecond)
-
-		rf.mu.Lock()
-		currentState = rf.currentSeverState
-		rf.lastLeaderComTime = time.Now()
-		rf.mu.Unlock()
-	}*/
-
+	//If this server is a candidate with higher term then dont append the event.
+	//The server which sent the request should have voted for this server and marked itself as follower
 	if currentState == candidate {
 		rf.mu.Lock()
-		reply.CurrentTerm = rf.currentTerm - 1
+		reply.CurrentTerm = rf.currentTerm
 		reply.IsRequestSuccessful = false
 		reply.ServerState = candidate
 		rf.mu.Unlock()
@@ -391,55 +386,27 @@ func (rf *Raft) heartBeatSender() {
 
 	for currentServerState == leader && !isKilled {
 
-		var maxTerm int = -1
-		var maxTermLock sync.Mutex
 		var wg sync.WaitGroup
 
-		var serversResponded = 0
+		var serversResponded = 1 //including response of this won server
 		var serversRespLock sync.Mutex
 
 		for peerItr := 0; peerItr < len(rf.peers); peerItr++ {
 			if peerItr != rf.me {
 				wg.Add(1)
 
-				/*preceedingIndex := -1
-				preceedingTerm := -1
-				var preceedingCommand interface{}
-				var newCmd interface{} = ""
-				committedIndex := -1*/
-
-				/*rf.mu.Lock()
-
-				if rf.nextIndexForPeers[peerItr] != 0 {
-					preceedingIndex = rf.nextIndexForPeers[peerItr] - 1
-					preceedingTerm = rf.committedEventLog[preceedingIndex].Term
-					preceedingCommand = rf.committedEventLog[preceedingIndex].Command
-				}
-
-				if rf.nextIndexForPeers[peerItr] < len(rf.committedEventLog) {
-					newCmd = rf.committedEventLog[rf.nextIndexForPeers[peerItr]].Command
-				}
-
-				if rf.toBeCommittedEvent > 0 {
-					committedIndex = rf.toBeCommittedEvent - 1
-				}
-
-				rf.mu.Unlock()*/
-
-				go func(peerId int /*, newCmd interface{}, preceedingIndex int, preceedingTerm int, preceedingCmd interface{}, committedIndex int*/) {
+				go func(peerId int) {
 
 					preceedingIndex := -1
 					preceedingTerm := -1
-					//var preceedingCommand interface{}
-					var newCmd interface{} = ""
 					committedIndex := -1
+					var newCmd interface{} = ""
 
 					rf.mu.Lock()
 
 					if rf.nextIndexForPeers[peerId] != 0 {
 						preceedingIndex = rf.nextIndexForPeers[peerId] - 1
 						preceedingTerm = rf.committedEventLog[preceedingIndex].Term
-						//preceedingCommand = rf.committedEventLog[preceedingIndex].Command
 					}
 
 					if rf.nextIndexForPeers[peerId] < len(rf.committedEventLog) {
@@ -452,31 +419,41 @@ func (rf *Raft) heartBeatSender() {
 
 					rf.mu.Unlock()
 
-					/*if newCmd != "" {
-						fmt.Println("Server", rf.me, "sending command", newCmd, "for index", preceedingIndex+1, "to server", peerId)
-					}*/
-
-					args := AppendEntriesArgs{Term: rf.currentTerm, LeaderId: rf.me, NewCommand: newCmd, PreceedingIndex: preceedingIndex, PreceedingTerm: preceedingTerm /*PreceedingCommand: preceedingCmd, */, CommittedIndex: committedIndex}
+					args := AppendEntriesArgs{Term: rf.currentTerm, LeaderId: rf.me, NewCommand: newCmd, PreceedingIndex: preceedingIndex, PreceedingTerm: preceedingTerm, CommittedIndex: committedIndex}
 					reply := AppendEntriesReply{CurrentTerm: -1, IsRequestSuccessful: false}
 
 					wg.Done()
 
 					ok := rf.sendAppendEntries(peerId, &args, &reply)
 
+					//If server's state not been still leader then just abort this thread
+
+					rf.mu.Lock()
+					if rf.currentSeverState != leader {
+						rf.mu.Unlock()
+						return
+					}
+					rf.mu.Unlock()
+
 					if rf.currentSeverState == leader && ok && newCmd != "" {
 						fmt.Println("Peer", peerId, "responded for command", newCmd)
 					}
 
-					if ok {
-						maxTermLock.Lock()
-						if reply.CurrentTerm > maxTerm {
-							maxTerm = reply.CurrentTerm
-						}
-						maxTermLock.Unlock()
+					serversRespLock.Lock()
+					serversResponded += 1
+					serversRespLock.Unlock()
 
-						serversRespLock.Lock()
-						serversResponded += 1
-						serversRespLock.Unlock()
+					if ok {
+
+						//if replied server had a higher term then just convert this to follower
+						rf.mu.Lock()
+						if reply.CurrentTerm > rf.currentTerm {
+							rf.currentSeverState = follower
+							rf.currentTerm = reply.CurrentTerm
+							rf.mu.Unlock()
+							return
+						}
+						rf.mu.Unlock()
 
 						if newCmd != "" {
 							if !reply.IsRequestSuccessful {
@@ -489,44 +466,51 @@ func (rf *Raft) heartBeatSender() {
 									}
 
 									rf.mu.Unlock()
+								} else { //server which responded is a candidate with higher term
+									rf.mu.Lock()
+									rf.currentSeverState = follower
+									rf.mu.Unlock()
+									return
 								}
 							} else {
 								rf.mu.Lock()
 								rf.matchIndex[peerId] = rf.nextIndexForPeers[peerId]
 								rf.nextIndexForPeers[peerId] = preceedingIndex + 2
 								rf.mu.Unlock()
+
+								//CC
+								/*serversRespLock.Lock()
+								serversResponded += 1
+								serversRespLock.Unlock()*/
+
 							}
 						}
 					}
-					//wg.Done()
-				}(peerItr /*, newCmd, preceedingIndex, preceedingTerm, preceedingCommand, committedIndex*/)
+				}(peerItr)
 			}
 		}
 
-		wg.Wait() //should we wait for all of them to respond. We need only half of them to respond to get the majority
-
-		//var currentTerm int
+		wg.Wait()
 
 		rf.mu.Lock()
-		//currentTerm = rf.currentTerm
 		currentState := rf.currentSeverState
 		rf.mu.Unlock()
 
-		//If any of the follower has greater term than this leader server, convert this server to follower
-		/*if maxTerm == -1 || maxTerm > currentTerm {
-			rf.mu.Lock()
-			rf.currentTerm = maxTerm
-			rf.currentSeverState = follower
-			rf.mu.Unlock()
-			return
-		}*/
+		var currentServersResponded int
+		serversRespLock.Lock()
+		currentServersResponded = serversResponded
+		serversRespLock.Unlock()
 
-		for serversResponded < int(math.Ceil(float64((len(rf.peers)-1)/2.0))) && currentState == leader {
+		for currentServersResponded <= rf.majorityCount && currentState == leader {
 			time.Sleep(30 * time.Microsecond)
 
 			rf.mu.Lock()
 			currentState = rf.currentSeverState
 			rf.mu.Unlock()
+
+			serversRespLock.Lock()
+			currentServersResponded = serversResponded
+			serversRespLock.Unlock()
 		}
 
 		rf.mu.Lock()
@@ -549,7 +533,7 @@ func (rf *Raft) heartBeatSender() {
 				}
 			}
 
-			if serversWithReplica >= int(math.Ceil(float64((len(rf.peers))/2.0))) {
+			if serversWithReplica > rf.majorityCount {
 
 				applyMsg := ApplyMsg{CommandValid: true, Command: rf.committedEventLog[rf.toBeCommittedEvent].Command, CommandIndex: rf.toBeCommittedEvent + 1}
 
@@ -695,6 +679,8 @@ func (rf *Raft) ticker() {
 
 			rf.currentSeverState = candidate
 			rf.currentTerm += 1
+			rf.lastVotedTerm = currentTerm //candidate votes for itself
+			rf.votedFor = rf.me
 			currentTerm = rf.currentTerm
 			committedEventCount = len(rf.committedEventLog)
 
@@ -752,8 +738,8 @@ func (rf *Raft) ticker() {
 			termBeforeElection = rf.currentTerm
 			rf.mu.Unlock()
 
-			//we just need half of the servers to send votes to get the majority
-			for currentFinished < len(rf.peers) && currentVoteCount < int(math.Ceil(float64(len(rf.peers))/2.0)) && currentState == candidate && currentTerm == termBeforeElection {
+			//we just need votes from majority, so waiting only till we get majority votes
+			for currentFinished < len(rf.peers) && currentVoteCount <= rf.majorityCount && currentState == candidate && currentTerm == termBeforeElection {
 				time.Sleep(1 * time.Microsecond)
 
 				followerRespLock.Lock()
@@ -772,9 +758,7 @@ func (rf *Raft) ticker() {
 			if currentState == candidate && currentTerm == termBeforeElection {
 				followerRespLock.Lock()
 
-				var majorityCont int = int(math.Ceil(float64(len(rf.peers)) / 2.0))
-
-				if voteCount >= majorityCont {
+				if voteCount > rf.majorityCount {
 					rf.mu.Lock()
 					rf.currentSeverState = leader
 					fmt.Println("Server", rf.me, "is leader")
@@ -800,8 +784,6 @@ func (rf *Raft) ticker() {
 					rf.mu.Unlock()
 				}
 				followerRespLock.Unlock()
-			} else {
-				return
 			}
 
 		} else {
@@ -826,6 +808,7 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	rf.persister = persister
 	rf.me = me
 	rf.applyCh = applyCh
+	rf.majorityCount = len(rf.peers) / 2
 
 	// Your initialization code here (2A, 2B, 2C).
 	rf.currentTerm = 0
