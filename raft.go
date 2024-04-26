@@ -111,9 +111,10 @@ type RequestVoteReply struct {
 }
 
 type AppendEntriesArgs struct {
-	Term       int
-	LeaderId   int
-	NewCommand interface{}
+	Term           int
+	LeaderId       int
+	NewCommand     interface{}
+	NewCommandTerm int
 
 	PreceedingIndex int
 	PreceedingTerm  int
@@ -311,7 +312,7 @@ func (rf *Raft) AppendEntry(args *AppendEntriesArgs, reply *AppendEntriesReply) 
 
 		if args.NewCommand != "" {
 			//fmt.Println("Server", rf.me, "got data", args.NewCommand)
-			newEvent := Event{Command: args.NewCommand, Term: currentTerm}
+			newEvent := Event{Command: args.NewCommand /*Term: currentTerm*/, Term: args.NewCommandTerm}
 			rf.committedEventLog = append(rf.committedEventLog, newEvent)
 
 		}
@@ -401,6 +402,7 @@ func (rf *Raft) heartBeatSender() {
 					preceedingTerm := -1
 					committedIndex := -1
 					var newCmd interface{} = ""
+					var newCmdTerm int = -1
 
 					rf.mu.Lock()
 
@@ -411,6 +413,7 @@ func (rf *Raft) heartBeatSender() {
 
 					if rf.nextIndexForPeers[peerId] < len(rf.committedEventLog) {
 						newCmd = rf.committedEventLog[rf.nextIndexForPeers[peerId]].Command
+						newCmdTerm = rf.committedEventLog[rf.nextIndexForPeers[peerId]].Term
 					}
 
 					if rf.toBeCommittedEvent > 0 {
@@ -419,7 +422,7 @@ func (rf *Raft) heartBeatSender() {
 
 					rf.mu.Unlock()
 
-					args := AppendEntriesArgs{Term: rf.currentTerm, LeaderId: rf.me, NewCommand: newCmd, PreceedingIndex: preceedingIndex, PreceedingTerm: preceedingTerm, CommittedIndex: committedIndex}
+					args := AppendEntriesArgs{Term: rf.currentTerm, LeaderId: rf.me, NewCommand: newCmd, NewCommandTerm: newCmdTerm, PreceedingIndex: preceedingIndex, PreceedingTerm: preceedingTerm, CommittedIndex: committedIndex}
 					reply := AppendEntriesReply{CurrentTerm: -1, IsRequestSuccessful: false}
 
 					wg.Done()
@@ -761,7 +764,7 @@ func (rf *Raft) ticker() {
 				if voteCount > rf.majorityCount {
 					rf.mu.Lock()
 					rf.currentSeverState = leader
-					fmt.Println("Server", rf.me, "is leader")
+					fmt.Println("Server", rf.me, "is leader. To be committed event log", rf.toBeCommittedEvent)
 
 					if len(rf.committedEventLog) > 0 {
 						for peerItr := 0; peerItr < len(rf.peers); peerItr++ {
