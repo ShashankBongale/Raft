@@ -194,7 +194,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			reply.VoteGranted = true
 			rf.votedTerm = args.Term
 			rf.votedFor = args.CandidateId
-			rf.currentTerm = args.Term
+			//rf.currentTerm = args.Term
 			rf.leaderLastCommunicationTime = time.Now()
 			fmt.Println(rf.me, " Voted for ", args.CandidateId)
 			return
@@ -205,7 +205,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.VoteGranted = true
 		rf.votedTerm = args.Term
 		rf.votedFor = args.CandidateId
-		rf.currentTerm = args.Term
+		//rf.currentTerm = args.Term
 		rf.leaderLastCommunicationTime = time.Now()
 		fmt.Println(rf.me, " Voted for ", args.CandidateId)
 		return
@@ -278,35 +278,42 @@ func (rf *Raft) AppendEntries(args *AppendEntriesReq, reply *AppendEntriesRepl) 
 		return
 	}
 
-	rf.leaderLastCommunicationTime = time.Now()
+	/*rf.leaderLastCommunicationTime = time.Now()
 	rf.currentTerm = args.Term
 
-	rf.currentState = Follower //What happens when this is leader and it gets entry from some other assumed leader for same term? This should not happen as new leader will have higher term
-
-	//var prevLogIndex int = -1
-	//var prevLogTerm int = 0
-
-	//var logSize int = len(rf.log)
-
-	/*if len(rf.log) > 0 {
-
-		prevLogIndex = logSize - 1
-		prevLogTerm = rf.log[prevLogIndex].Term
-
-		if prevLogTerm != args.PrevLogTerm || prevLogIndex != args.PrevLogIndex {
-
-			rf.mu.Unlock()
-			return
-		}
-
-	}*/
+	rf.currentState = Follower //What happens when this is leader and it gets entry from some other assumed leader for same term? This should not happen as new leader will have higher term*/
 
 	var toBeAppenededIndex int = args.AppendingIndex
 	var prevIndex int = toBeAppenededIndex - 1
 
+	/*if args.AppendingIndex <= rf.commitIndex || (rf.commitIndex >= 0 && rf.log[rf.commitIndex].Term != args.Term) {
+
+		rf.mu.Unlock()
+		return
+	}*/
+
+	if args.AppendingIndex <= rf.commitIndex {
+
+		if len(args.LogEntries) > 0 {
+			if rf.log[args.AppendingIndex] == args.LogEntries[0].Command {
+				reply.IsSuccess = true
+
+				rf.leaderLastCommunicationTime = time.Now()
+				rf.currentTerm = args.Term
+
+				rf.currentState = Follower
+			}
+
+		}
+
+		rf.mu.Unlock()
+		return
+	}
+
 	if prevIndex < len(rf.log) && prevIndex >= 0 {
 
 		if rf.log[prevIndex].Term != args.PrevLogTerm /*|| args.AppendingIndex <= rf.commitIndex*/ {
+			rf.leaderLastCommunicationTime = time.Now()
 
 			rf.mu.Unlock()
 			return
@@ -315,12 +322,16 @@ func (rf *Raft) AppendEntries(args *AppendEntriesReq, reply *AppendEntriesRepl) 
 
 		rf.mu.Unlock()
 		return
-	} else if args.AppendingIndex <= rf.commitIndex && rf.log[rf.commitIndex].Term != args.Term {
+	} /*else if args.AppendingIndex <= rf.commitIndex || (rf.commitIndex >= 0 && rf.log[rf.commitIndex].Term != args.Term) {
 
 		rf.mu.Unlock()
 		return
-	}
+	}*/
 
+	rf.leaderLastCommunicationTime = time.Now()
+	rf.currentTerm = args.Term
+
+	rf.currentState = Follower
 	if len(args.LogEntries) > 0 {
 
 		fmt.Println(rf.me, " Recved ", args.LogEntries[0].Command)
@@ -342,16 +353,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesReq, reply *AppendEntriesRepl) 
 	//need logic to update committed index
 
 	prevCommitIndex := rf.commitIndex
-
-	/*if args.LeaderCommitIndex > rf.commitIndex {
-
-		if args.LeaderCommitIndex <= len(rf.log)-1 {
-			rf.commitIndex = args.LeaderCommitIndex
-		} else {
-
-			rf.commitIndex = len(rf.log) - 1
-		}
-	}*/
 
 	if args.LeaderCommitIndex > rf.commitIndex {
 
