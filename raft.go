@@ -1,22 +1,5 @@
 package raft
 
-//
-// this is an outline of the API that raft must expose to
-// the service (or tester). see comments below for
-// each of these functions for more details.
-//
-// rf = Make(...)
-//   create a new raft server.
-// rf.Start(command interface{}) (index, term, isleader)
-//   start agreement on a new log entry
-// rf.GetState() (term, isLeader)
-//   ask a raft for its current term, and whether it thinks it is leader
-// ApplyMsg
-//   each time a new entry is committed to the log, each raft peer
-//   should send an ApplyMsg to the service (or tester)
-//   in the same server.
-//
-
 import (
 	"fmt"
 	"math/rand"
@@ -26,22 +9,28 @@ import (
 	"time"
 )
 
-// import "bytes"
-// import "../labgob"
-
-// as each raft peer becomes aware that successive log entries are
-// committed, the peer should send an ApplyMsg to the service (or
-// tester) on the same server, via the applyCh passed to Make(). set
-// CommandValid to true to indicate that the ApplyMsg contains a newly
-// committed log entry.
-//
-// in Lab 3 you'll want to send other kinds of messages (e.g.,
-// snapshots) on the applyCh; at that point you can add fields to
-// ApplyMsg, but set CommandValid to false for these other uses.
 type ApplyMsg struct {
 	CommandValid bool
 	Command      interface{}
 	CommandIndex int
+}
+
+type logEntity struct {
+	Term    int
+	Command interface{}
+}
+
+type RequestVoteArgs struct {
+	Term         int
+	CandidateId  int
+	LastLogIndex int
+	LastLogTerm  int
+}
+
+type RequestVoteReply struct {
+	Term        int
+	VoteGranted bool
+	VoteCounted bool
 }
 
 type ServerState int
@@ -53,9 +42,19 @@ const (
 	Leader
 )
 
-type logEntity struct {
-	Term    int
-	Command interface{}
+type AppendEntriesReq struct {
+	Term              int
+	LeaderId          int
+	PrevLogIndex      int
+	PrevLogTerm       int
+	LogEntries        []logEntity
+	LeaderCommitIndex int
+	AppendingIndex    int
+}
+
+type AppendEntriesRepl struct {
+	IsSuccess bool
+	GotReply  bool
 }
 
 // A Go object implementing a single raft peer.
@@ -93,20 +92,16 @@ type Raft struct {
 	applyCh chan ApplyMsg
 }
 
-// return currentTerm and whether this server
-// believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
 
 	var term int
 	var isleader bool
-	// Your code here (2A).
 
 	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
 	term = rf.currentTerm
 	isleader = rf.currentState == Leader
-
-	//fmt.Println("GetState: ", rf.me, " term ", term, " is leader: ", isleader)
-	rf.mu.Unlock()
 
 	return term, isleader
 }
@@ -145,40 +140,12 @@ func (rf *Raft) readPersist(data []byte) {
 	// }
 }
 
-// example RequestVote RPC arguments structure.
-// field names must start with capital letters!
-type RequestVoteArgs struct {
-	// Your data here (2A, 2B).
-
-	Term         int
-	CandidateId  int
-	LastLogIndex int
-	LastLogTerm  int
-}
-
-// example RequestVote RPC reply structure.
-// field names must start with capital letters!
-type RequestVoteReply struct {
-	// Your data here (2A).
-
-	Term        int
-	VoteGranted bool
-	VoteCounted bool
-}
-
-// example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
-	// Your code here (2A, 2B).
 
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
 	reply.VoteGranted = false
-
-	if rf.votedTerm == args.Term {
-		//fmt.Println(rf.me, " Rejecting vote for ", args.CandidateId, " as already voted for ", rf.votedFor, " in same term")
-		return
-	}
 
 	currLastLogTerm := 0
 	currLastLogIndex := len(rf.log)
@@ -187,6 +154,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		currLastLogTerm = rf.log[currLastLogIndex-1].Term
 	}
 
+	//Follower votes only if candidate is as updated as follower or has more data
 	if currLastLogTerm == args.LastLogTerm {
 
 		if currLastLogIndex <= args.LastLogIndex {
@@ -194,7 +162,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			reply.VoteGranted = true
 			rf.votedTerm = args.Term
 			rf.votedFor = args.CandidateId
-			//rf.currentTerm = args.Term
 			rf.leaderLastCommunicationTime = time.Now()
 			fmt.Println(rf.me, " Voted for ", args.CandidateId)
 			return
@@ -205,7 +172,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.VoteGranted = true
 		rf.votedTerm = args.Term
 		rf.votedFor = args.CandidateId
-		//rf.currentTerm = args.Term
 		rf.leaderLastCommunicationTime = time.Now()
 		fmt.Println(rf.me, " Voted for ", args.CandidateId)
 		return
@@ -247,21 +213,6 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
-type AppendEntriesReq struct {
-	Term              int
-	LeaderId          int
-	PrevLogIndex      int
-	PrevLogTerm       int
-	LogEntries        []logEntity
-	LeaderCommitIndex int
-	AppendingIndex    int
-}
-
-type AppendEntriesRepl struct {
-	IsSuccess bool
-	GotReply  bool
-}
-
 func (rf *Raft) AppendEntries(args *AppendEntriesReq, reply *AppendEntriesRepl) {
 
 	fmt.Println(rf.me, "got append request from ", args.LeaderId)
@@ -278,30 +229,55 @@ func (rf *Raft) AppendEntries(args *AppendEntriesReq, reply *AppendEntriesRepl) 
 		return
 	}
 
-	/*rf.leaderLastCommunicationTime = time.Now()
-	rf.currentTerm = args.Term
-
-	rf.currentState = Follower //What happens when this is leader and it gets entry from some other assumed leader for same term? This should not happen as new leader will have higher term*/
-
 	var toBeAppenededIndex int = args.AppendingIndex
 	var prevIndex int = toBeAppenededIndex - 1
-
-	/*if args.AppendingIndex <= rf.commitIndex || (rf.commitIndex >= 0 && rf.log[rf.commitIndex].Term != args.Term) {
-
-		rf.mu.Unlock()
-		return
-	}*/
 
 	if args.AppendingIndex <= rf.commitIndex {
 
 		if len(args.LogEntries) > 0 {
 			if rf.log[args.AppendingIndex] == args.LogEntries[0].Command {
+
+				//duplicate data => so just accept it
 				reply.IsSuccess = true
+				rf.leaderLastCommunicationTime = time.Now()
+				rf.currentTerm = args.Term
+				rf.currentState = Follower
+
+			} else if rf.log[args.AppendingIndex].Term < args.LogEntries[0].Term {
+
+				//new data with higher term leader so just accept it
+				//What if this data is committed?
 
 				rf.leaderLastCommunicationTime = time.Now()
 				rf.currentTerm = args.Term
-
 				rf.currentState = Follower
+
+				rf.log[args.AppendingIndex] = args.LogEntries[0]
+				rf.lastApplied = args.AppendingIndex
+
+				rf.log = rf.log[:rf.lastApplied+1] //deleting all entries after this
+
+				prevCommitIndex := rf.commitIndex
+
+				rf.commitIndex = rf.lastApplied
+				if args.LeaderCommitIndex > rf.commitIndex {
+
+					if args.LeaderCommitIndex <= rf.lastApplied {
+						rf.commitIndex = args.LeaderCommitIndex
+					} else {
+						rf.commitIndex = rf.lastApplied
+					}
+				}
+
+				if prevCommitIndex != rf.commitIndex {
+
+					fmt.Println("Committing index ", rf.commitIndex, " with data ", rf.log[rf.commitIndex].Command, " by ", rf.me)
+
+					var msg ApplyMsg = ApplyMsg{CommandValid: true, Command: rf.log[rf.commitIndex].Command, CommandIndex: rf.commitIndex + 1}
+
+					rf.applyCh <- msg
+				}
+
 			}
 
 		}
@@ -310,23 +286,21 @@ func (rf *Raft) AppendEntries(args *AppendEntriesReq, reply *AppendEntriesRepl) 
 		return
 	}
 
+	//Log matching condition
 	if prevIndex < len(rf.log) && prevIndex >= 0 {
 
-		if rf.log[prevIndex].Term != args.PrevLogTerm /*|| args.AppendingIndex <= rf.commitIndex*/ {
-			rf.leaderLastCommunicationTime = time.Now()
+		if rf.log[prevIndex].Term != args.PrevLogTerm {
 
+			rf.leaderLastCommunicationTime = time.Now()
 			rf.mu.Unlock()
+
 			return
 		}
 	} else if prevIndex != -1 {
 
 		rf.mu.Unlock()
 		return
-	} /*else if args.AppendingIndex <= rf.commitIndex || (rf.commitIndex >= 0 && rf.log[rf.commitIndex].Term != args.Term) {
-
-		rf.mu.Unlock()
-		return
-	}*/
+	}
 
 	rf.leaderLastCommunicationTime = time.Now()
 	rf.currentTerm = args.Term
@@ -349,8 +323,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesReq, reply *AppendEntriesRepl) 
 			rf.lastApplied = currentIndex
 		}
 	}
-
-	//need logic to update committed index
 
 	prevCommitIndex := rf.commitIndex
 
@@ -389,21 +361,18 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesReq, reply *App
 			rf.mu.Lock()
 
 			rf.nextIndex[server] += 1
-			rf.matchIndex[server] = args.PrevLogIndex + 1 //Need a thread to check matchIndex and commit logs
+			rf.matchIndex[server] = args.PrevLogIndex + 1
 
 			toBeCommittedIndex := rf.commitIndex + 1
 
-			peerItr := 0
 			majorityCount := 0
 
-			for peerItr < len(rf.matchIndex) {
+			for peerItr := 0; peerItr < len(rf.matchIndex); peerItr++ {
 
 				if rf.matchIndex[peerItr] >= toBeCommittedIndex && toBeCommittedIndex < len(rf.log) {
 
 					majorityCount += 1
 				}
-
-				peerItr += 1
 			}
 
 			if majorityCount >= rf.majorityCount {
@@ -535,12 +504,9 @@ func (rf *Raft) SendHeartBeat() {
 			return
 		}
 
-		peerItr := 0
-
-		for peerItr < len(rf.peers) {
+		for peerItr := 0; peerItr < len(rf.peers); peerItr++ {
 
 			if peerItr == rf.me {
-				peerItr += 1
 				continue
 			}
 
@@ -548,7 +514,6 @@ func (rf *Raft) SendHeartBeat() {
 
 			nextIndex = rf.nextIndex[peerItr]
 
-			//fmt.Println("Next index for ", peerItr, " ", nextIndex)
 			var logToSend []logEntity
 
 			var prevLogIndex int = -1
@@ -562,9 +527,9 @@ func (rf *Raft) SendHeartBeat() {
 					prevLogTerm = rf.log[prevLogIndex].Term
 				}
 
-				fmt.Println("Leader log length ", len(rf.log))
+				fmt.Println("Leader ", rf.me, " log length ", len(rf.log))
 
-				if /*nextIndex == 0 ||*/ nextIndex < len(rf.log) {
+				if nextIndex < len(rf.log) {
 
 					logObj := rf.log[nextIndex]
 					logToSend = append(logToSend, logObj) //sending only one as of now. Need to optimise this.
@@ -583,8 +548,6 @@ func (rf *Raft) SendHeartBeat() {
 			}
 
 			go rf.sendAppendEntries(peerItr, &appendEntryReq, &appendEntryRepl)
-
-			peerItr += 1
 		}
 
 		time.Sleep(100 * time.Millisecond)
@@ -775,31 +738,17 @@ func (rf *Raft) CheckForLeaderContact() {
 
 }
 
-// the service or tester wants to create a Raft server. the ports
-// of all the Raft servers (including this one) are in peers[]. this
-// server's port is peers[me]. all the servers' peers[] arrays
-// have the same order. persister is a place for this server to
-// save its persistent state, and also initially holds the most
-// recent saved state, if any. applyCh is a channel on which the
-// tester or service expects Raft to send ApplyMsg messages.
-// Make() must return quickly, so it should start goroutines
-// for any long-running work.
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
 	rf := &Raft{}
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
-
-	//fmt.Println("Id of current instance ", rf.me)
-
-	// Your initialization code here (2A, 2B, 2C).
-
 	rf.currentTerm = 0
 	rf.votedFor = -1
 	rf.currentState = Follower
 	rf.votedTerm = -1
-	rf.electionTimeOutOffset = rand.Intn(1000-300) + 300
+	rf.electionTimeOutOffset = rand.Intn(1000-300) + (rf.me+1)*300
 	rf.commitIndex = -1
 	rf.lastApplied = -1
 
